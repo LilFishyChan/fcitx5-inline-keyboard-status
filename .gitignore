@@ -1,0 +1,5 @@
+build/
+Testing/
+*.so
+*.bak
+*.rewrite-bak
