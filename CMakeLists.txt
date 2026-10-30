@@ -8,6 +8,7 @@ find_package(Fcitx5Core REQUIRED)
 
 add_library(inline-keyboard-status MODULE src/inline-keyboard-status.cpp
     src/addon-support.cpp
+    src/client-channel.cpp
     src/candidate-payload.cpp)
 target_link_libraries(inline-keyboard-status PRIVATE Fcitx5::Core)
 
@@ -48,3 +49,12 @@ add_executable(test-candidate-payload
 )
 target_include_directories(test-candidate-payload PRIVATE src)
 add_test(NAME candidate-payload COMMAND test-candidate-payload)
+
+# 客户端 socket 的写入 / 失败判定：fcitx5 崩在这里过（EBADF 被当致命异常），
+# 每个分支都钉住。
+add_executable(test-client-channel
+    tests/test_client_channel.cpp
+    src/client-channel.cpp
+)
+target_include_directories(test-client-channel PRIVATE src)
+add_test(NAME client-channel COMMAND test-client-channel)

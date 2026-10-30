@@ -53,6 +53,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "client-channel.h"
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -230,8 +232,21 @@ private:
                 auto &icEvent = static_cast<fcitx::InputContextEvent &>(event);
                 if (auto *ic = icEvent.inputContext()) {
                     logEvent("focus in fe=" + std::string(ic->frontendName()));
+                    focused_ = true;
+                    pushLine(inline_keyboard::focusMessage(true));
                     pushState(ic);
                 }
+            }));
+        // 失焦：只发一条不依赖 context 的消息。这里**不能**读 InputContext
+        // （失焦那一刻它正在销毁），所以只置标志 + pushLine。
+        handlers_.emplace_back(instance_->watchEvent(
+            fcitx::EventType::InputContextFocusOut,
+            fcitx::EventWatcherPhase::Default,
+            [this](fcitx::Event &) {
+                if (!focused_)
+                    return;
+                focused_ = false;
+                pushLine(inline_keyboard::focusMessage(false));
             }));
         handlers_.emplace_back(instance_->watchEvent(
             fcitx::EventType::InputContextInputMethodActivated,
@@ -403,7 +418,7 @@ private:
         // 只在 socket 没连上时才落盘。
         // 这个文件是给 probe.sh 自检用的兜底，socket 通着的时候写它纯属浪费：
         // addon 每 40ms 推一次状态，等于每秒 25 次磁盘 IO。
-        if (clientFd_ < 0) {
+        if (clientFd_ < 0 || clientClosing_) {
             inline_keyboard::atomicWrite(statusPath_, json + "\n");
         }
         // 只在内容真的变了时打一行：状态推送是排查「候选为什么不出现」
@@ -739,8 +754,9 @@ private:
         if (fd < 0) {
             return;
         }
-        // 单客户端设计：新连接顶掉旧的
-        closeClient("replaced-by-new-client");
+        // 单客户端设计：新连接顶掉旧的。这里在 accept 回调里，
+        // 旧的 clientWatcher_ 不在 dispatch 状态，可以立即关
+        closeClientNow("replaced-by-new-client");
         clientFd_ = fd;
         clientBuffer_.clear();
         lastStateJson_.clear();
@@ -748,6 +764,8 @@ private:
         // 立刻给一份完整快照。不能等下一次 update()：
         // 键盘没输入时 update() 不会触发，新客户端会一直空等。
         writeImList();
+        // 焦点状态也是状态的一部分，连上就先告诉客户端一次
+        pushLine(inline_keyboard::focusMessage(focused_));
         if (auto *ic = activeContext()) {
             pushState(ic);
         }
@@ -766,9 +784,14 @@ private:
         markShown(true);
     }
 
-    void closeClient(const char *why = "unknown") {
-        const bool hadClient = clientFd_ >= 0;
-        if (hadClient) {
+    // 立即关：只能在「不在这个 client 的 IO 回调里」时调（accept 回调、析构）。
+    // 会一并取消已排队的延迟关闭。
+    void closeClientNow(const char *why = "unknown") {
+        if (deferClose_) {
+            deferClose_.reset();
+        }
+        const bool had = clientFd_ >= 0;
+        if (had) {
             logEvent(std::string("client closed why=") + why);
         }
         clientWatcher_.reset();
@@ -777,9 +800,33 @@ private:
             clientFd_ = -1;
         }
         clientBuffer_.clear();
-        if (hadClient) {
+        clientClosing_ = false;
+        if (had) {
             markShown(false);
         }
+    }
+
+    // 延迟关：IO 回调里用。destroy 正在 dispatch 的 EventSource 会让 sd-event
+    // 报 EBADF，fcitx5 把 EventLoopException 当致命错误直接 abort
+    // （event_sdevent.cpp:277）。
+    void closeClient(const char *why = "unknown") {
+        if (clientFd_ < 0 || clientClosing_)
+            return;
+        clientClosing_ = true;
+        logEvent(std::string("client closed why=") + why);
+        deferClose_ = instance_->eventLoop().addDeferEvent(
+            [this](fcitx::EventSource *) {
+                deferClose_.reset();
+                clientWatcher_.reset();
+                if (clientFd_ >= 0) {
+                    ::close(clientFd_);
+                    clientFd_ = -1;
+                }
+                clientBuffer_.clear();
+                clientClosing_ = false;
+                markShown(false);
+                return true;
+            });
     }
 
     void readClient() {
@@ -884,12 +931,10 @@ private:
     }
 
     void pushLine(const std::string &line) {
-        if (clientFd_ < 0) {
+        if (clientFd_ < 0 || clientClosing_) {
             return;
         }
-        const std::string data = line + "\n";
-        const ssize_t written = ::write(clientFd_, data.data(), data.size());
-        if (written < 0 && errno != EAGAIN) {
+        if (!inline_keyboard::writeLineToClient(clientFd_, line)) {
             closeClient("write-error");
         }
     }
@@ -946,7 +991,7 @@ private:
 
     ~InlineKeyboardStatus() override {
         handlers_.clear();
-        closeClient();
+        closeClientNow();
         if (listenFd_ >= 0) {
             ::close(listenFd_);
         }
@@ -964,6 +1009,9 @@ private:
     std::string clientBuffer_;
     std::unique_ptr<fcitx::EventSourceIO> acceptWatcher_;
     std::unique_ptr<fcitx::EventSourceIO> clientWatcher_;
+    // 已排队关闭：这段窗口里 fd 还在，但不能再往里写
+    bool clientClosing_ = false;
+    std::unique_ptr<fcitx::EventSource> deferClose_;
 
     // 文件兜底（probe.sh 用）
     std::string statusPath_;
@@ -977,6 +1025,8 @@ private:
 
     // 键盘开合
     bool shown_ = false;
+    // 当前有没有输入框拿着焦点，变化时随 focus:0/1 推给客户端
+    bool focused_ = false;
     bool uiAvailable_ = true;
     // addTimeEvent 返回 unique_ptr：必须持有，析构掉的话回调不会跑
     std::unique_ptr<fcitx::EventSourceTime> restoreTimer_;
