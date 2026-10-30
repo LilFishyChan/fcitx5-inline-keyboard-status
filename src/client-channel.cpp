@@ -16,6 +16,19 @@ bool writeIsFatal(ssize_t written, int err) {
     return err != EAGAIN && err != EWOULDBLOCK && err != EINTR;
 }
 
+bool clientIsAlive(bool fdOpen, bool closing, int64_t nowUs,
+                   int64_t lastSeenUs, int64_t timeoutUs) {
+    if (!fdOpen || closing) {
+        return false;
+    }
+    // lastSeenUs 为 0 表示刚 accept、还没收到任何字节：
+    // 给它一个完整的超时窗口，不算超时。
+    if (lastSeenUs <= 0) {
+        return true;
+    }
+    return (nowUs - lastSeenUs) < timeoutUs;
+}
+
 bool writeLineToClient(int fd, const std::string &line) {
     if (fd < 0) {
         return false;

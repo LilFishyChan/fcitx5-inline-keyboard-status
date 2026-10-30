@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include "client-channel.h"
+#include "heartbeat.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -134,13 +135,15 @@ private:
 
     // 收起后延迟交还 UI：窗口刚销毁时 InputPanel 的候选挂载点还在切换，
     // 立刻交还再打开会取不到候选。留一拍让窗口先消失。
-    // 期间如果又开了（shown_ 变回 true），这次交还作废。
+    // 期间如果归属又变回 addon（新连接来了），这次交还作废。
     void scheduleRestore() {
         restoreTimer_ = instance_->eventLoop().addTimeEvent(
             CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + kRestoreDelayUs, 0,
             [this](fcitx::EventSourceTime *, uint64_t) {
-                if (shown_) {
-                    logEvent("restore cancelled shown=1");
+                // 判据是「期望归属」，不是 fcitx5 说的 shown_ ——
+                // 后者会被任何焦点变化改掉，用它会把该交还的取消掉
+                if (uiOwned_) {
+                    logEvent("restore cancelled owner=addon");
                     return true;
                 }
                 instance_->setInputMethodMode(
@@ -151,49 +154,39 @@ private:
             });
     }
 
-    // 键盘开合的单一入口，两个来源共用：
-    //   · fcitx5 的 show/hideVirtualKeyboard 回调（官方路径）
-    //   · socket 的连接/断开（插件从不发 mode:osk，只能这么感知）
-    // 只记录开合事实，**绝不碰 InputMethodMode**：fcitx5 切模式时本来就会回调
-    // show/hide，在这里再切就是「切模式 → 回调 → 再切模式」的回环 —— 早期版本
-    // 每秒来回十几次，UI 在 addon 和 classicui 之间反复重选（候选挂载点跟着换，
-    // 表现为按键打不进去、候选永远空），socket 也被顶断（实测 BrokenPipe）。
-    // 模式统一由 ensureOnScreenMode() 在注入按键前保证，职责单一。
+    // fcitx5 的 show/hideVirtualKeyboard 回调。**只记录事实，不动 UI 归属**：
+    // 键盘是浮层、从不注册成 InputContext，fcitx5 会因为任何焦点变化调 hide，
+    // 在这里跟着切模式就是「切模式 → 回调 → 再切模式」的回环（早期版本每秒
+    // 来回十几次，候选挂载点跟着换，按键打不进去）。归属只由连接生命周期决定。
     void markShown(bool shown) {
         if (shown == shown_)
             return;
         shown_ = shown;
-        logEvent(std::string("setShown shown=") + (shown ? "1" : "0"));
+        logEvent(std::string("fcitx says shown=") + (shown ? "1" : "0"));
+    }
 
-        if (!shown) {
-            // 只记录，不交还。
-            //
-            // 键盘是 WlrLayer.Overlay 浮层，从不注册成 InputContext，所以
-            // fcitx5 会因为**任何焦点变化**调 hideVirtualKeyboard —— 用户切到
-            // 别的窗口、甚至只是在应用里点一下，都会被当成「键盘该收了」。
-            // 以前这里排 restore，结果是键盘还开着、UI 已经被交还给 classicui，
-            // 候选窗突然变回带序号的老样式，空格上的输入法标签也不再更新。
-            //
-            // UI 归属只由插件显式控制：打开时 reclaim，关闭时 release。
-            return;
-        }
-
-        // 弹出时声明自己是当前输入法前端。
-        // UIType 已经是 OnScreenKeyboard，配合 setInputMethodMode 让 fcitx5
-        // 把 UI 判给 addon（classicui 随之 suspend，否则两个候选窗同时显示）。
+    // 声明自己是当前输入法前端，让 fcitx5 把 UI 判给 addon
+    // （classicui 随之 suspend，否则两个候选窗同时显示）。
+    // 这是「拿回 UI」的唯一实现，claim/reclaim/超时恢复都走它。
+    void claimUi() {
+        // setInputMethodMode 会顺带切输入法（OnScreenKeyboard 模式有自己的默认 IM），
+        // 抢一次 UI 就换一次用户的输入法，所以先记下来再恢复
+        const std::string previousIm = instance_->currentInputMethod();
         instance_->setInputMethodMode(fcitx::InputMethodMode::OnScreenKeyboard);
+        if (!previousIm.empty() &&
+            instance_->currentInputMethod() != previousIm) {
+            instance_->setCurrentInputMethod(previousIm);
+        }
         writeImList();
         // 同步补推一次状态：update() 只在预编辑/候选变化时才来，
         // 键盘刚开、还没打字时一次都不会调，空格上的输入法标签就是空的。
-        // 必须在这里同步取 ic —— 放进延迟回调里会在 IC 已销毁后再取快照，
+        // 必须同步取 ic —— 放进延迟回调里会在 IC 已销毁后再取快照，
         // 直接空指针跳转把 fcitx5 带崩。
         if (auto *ctx = activeContext())
             pushState(ctx);
-
         // 必须**延迟**再让 fcitx5 重选 UI：立刻调时 addon 状态还没稳定，
-        // 实测不生效（原始实现也是这么写的，注释记着「立刻调实测不生效」）。
-        // 少了这一步，模式虽然切到 OnScreenKeyboard，UI 却仍留在 classicui，
-        // update() 一次都不会被调用 —— 表现为按键打得进去、候选永远空。
+        // 实测不生效（原始实现也是这么写的）。少了这一步，模式虽然切到
+        // OnScreenKeyboard，UI 却仍留在 classicui，update() 一次都不会被调用。
         // 返回值必须接住：addTimeEvent 给的是 unique_ptr，立刻析构的话
         // 回调永远不会跑（原始实现那条也没存，所以它其实从没生效过）。
         uiReselectTimer_ = instance_->eventLoop().addTimeEvent(
@@ -205,9 +198,94 @@ private:
             });
     }
 
+    // 期望是 addon、但 fcitx5 现在把 UI 判给了别人。
+    // 心跳里调，2s 一次，天然限流 —— 比原来「等插件发现被顶掉再发 reclaim」及时。
+    void ensureUiOwner() {
+        if (!uiOwned_)
+            return;
+        const std::string current = instance_->userInterfaceManager().currentUI();
+        if (current == selfUiName())
+            return;
+        logEvent("ui drift current=" + current + " -> reclaim");
+        claimUi();
+    }
+
     static constexpr uint64_t kRestoreDelayUs = 300000;
     // 切模式后 UI 重选的延迟。原始实现用 50ms，沿用。
     static constexpr uint64_t kUiReselectDelayUs = 50000;
+    // 心跳：每 2s 推一条 ping。5s 收不到对端任何消息就判死 ——
+    // 允许丢一个 ping，但不能连丢两个。判死后立刻交还 UI，
+    // 不让一个僵死的连接占着键盘内 UI。
+    static constexpr uint64_t kHeartbeatIntervalUs = 2000000;
+    static constexpr int64_t kClientTimeoutUs = 5000000;
+
+    static int64_t monotonicUs() {
+        return static_cast<int64_t>(fcitx::now(CLOCK_MONOTONIC));
+    }
+
+    bool clientAlive() const {
+        if (clientFd_ < 0 || clientClosing_ || !heartbeat_.active()) {
+            return false;
+        }
+        return inline_keyboard::clientIsAlive(
+            true, false, monotonicUs(), heartbeat_.lastSeenUs(), kClientTimeoutUs);
+    }
+
+    /**
+     * UI 归属的唯一判据：有没有活着的客户端。
+     *
+     * 以前这件事由三处共同决定 —— socket 连接、release/reclaim 命令、
+     * fcitx5 的 InputMethodMode 回调 —— 互相打架时表现成「键盘开着但候选窗
+     * 回到 classicui 样式」。心跳让「对端还在」成为可验证的事实之后，
+     * 这里收敛成一个判断，只在归属真的翻转时才动 fcitx5。
+     */
+    void updateUiOwnership() {
+        const bool owns = clientAlive();
+        if (owns == uiOwned_) {
+            return;
+        }
+        uiOwned_ = owns;
+        logEvent(std::string("ui owner -> ") + (owns ? "addon" : "classicui"));
+        if (owns) {
+            claimUi();
+            return;
+        }
+        // 连接没了：键盘内 UI 必须让出来，哪怕是超时判死的
+        shown_ = false;
+        scheduleRestore();
+    }
+
+    // 每 2s 一拍：ping 既证明自己活着，也是超时检查的节拍。
+    // 每次新客户端都重新排一次 —— 上一个客户端结束后 timer 可能已经不在跑，
+    // 靠「已存在就不排」会让第二个连接完全没有心跳。
+    void startHeartbeat() {
+        heartbeatTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + kHeartbeatIntervalUs,
+            0, [this](fcitx::EventSourceTime *source, uint64_t) {
+                // 该 ping 还是该判死由状态机决定（可单测），这里只负责执行
+                switch (heartbeat_.onTick(monotonicUs())) {
+                case inline_keyboard::HeartbeatState::Tick::Ping:
+                    pushLine("ping:" + std::to_string(heartbeat_.pingSeq()));
+                    break;
+                case inline_keyboard::HeartbeatState::Tick::Timeout:
+                    // 对端僵死（进程被冻住、调试器停住）：主动断开，交还 UI
+                    closeClient("heartbeat-timeout");
+                    break;
+                case inline_keyboard::HeartbeatState::Tick::None:
+                    break;
+                }
+                updateUiOwnership();
+                // 归属没变、但 UI 被 classicui 抢走了：补一次
+                ensureUiOwner();
+                // sd-event 的 time source 触发一次后会被 disarm：
+                // setTime 只改时间，不重新启用。少了 setEnabled(true)
+                // 心跳就只响第一拍（实测就是这么漏掉的）。
+                source->setTime(fcitx::now(CLOCK_MONOTONIC) +
+                                kHeartbeatIntervalUs);
+                source->setEnabled(true);
+                return true;
+            });
+    }
 
     // ---------------- 输入法变化：事件驱动 ----------------
 
@@ -781,7 +859,9 @@ private:
         // 收起立即断开）。这是唯一可靠的开关信号：插件不发 mode:osk，
         // 光等 showVirtualKeyboard() 的话永远不会被调用，模式一直停在
         // PhysicalKeyboard，fcitx5 就把 VirtualKeyboardEvent 全当噪声丢了。
-        markShown(true);
+        heartbeat_.onAccept(monotonicUs());
+        startHeartbeat();
+        updateUiOwnership();
     }
 
     // 立即关：只能在「不在这个 client 的 IO 回调里」时调（accept 回调、析构）。
@@ -801,9 +881,8 @@ private:
         }
         clientBuffer_.clear();
         clientClosing_ = false;
-        if (had) {
-            markShown(false);
-        }
+        heartbeat_.onClosed();
+        updateUiOwnership();
     }
 
     // 延迟关：IO 回调里用。destroy 正在 dispatch 的 EventSource 会让 sd-event
@@ -824,7 +903,8 @@ private:
                 }
                 clientBuffer_.clear();
                 clientClosing_ = false;
-                markShown(false);
+                heartbeat_.onClosed();
+                updateUiOwnership();
                 return true;
             });
     }
@@ -836,6 +916,8 @@ private:
             closeClient(count == 0 ? "peer-eof" : "read-error");
             return;
         }
+        // 收到任何字节都算活着（pong、按键、命令都行）
+        heartbeat_.onData(monotonicUs());
         clientBuffer_.append(buffer, static_cast<size_t>(count));
         size_t newline = 0;
         while ((newline = clientBuffer_.find('\n')) != std::string::npos) {
@@ -871,31 +953,20 @@ private:
             selectCandidate(std::atoi(line.c_str() + 7));
             return;
         }
+        if (line == "pong") {
+            // 心跳回应。活着这件事已经由 readClient 记下了，这里不用做事。
+            return;
+        }
         if (line == "release") {
-            // 插件关闭键盘时显式要求交还 UI。
-            // 只靠 socket 断开（peer-eof -> markShown(false)）不够：
-            // shown_ 可能已经是 false，那条路会被状态去重挡掉。
-            logEvent("release requested");
-            // 插件已经明确说"键盘关了"，就以它为准把状态置成收起。
-            // 不置的话 scheduleRestore 的回调会看到 shown_ 仍是 true
-            // 而取消这次交还（日志 "restore cancelled shown=1"）。
-            shown_ = false;
-            scheduleRestore();
+            // 旧的显式交还命令。现在 UI 归属只跟「活着的连接」走：
+            // 断开连接本身就会交还，这条留着只是为了兼容还在发它的旧插件。
+            logEvent("release requested (ignored)");
             return;
         }
         if (line == "reclaim") {
-            // 插件发现 UI 被顶掉了，要求重新申领。
-            // 只做「切模式 + 重选 UI」，不改 shown_（键盘是否开着由插件判断）。
-            auto &manager = instance_->userInterfaceManager();
-            const std::string previousIm = instance_->currentInputMethod();
-            instance_->setInputMethodMode(
-                fcitx::InputMethodMode::OnScreenKeyboard);
-            if (!previousIm.empty() &&
-                instance_->currentInputMethod() != previousIm) {
-                instance_->setCurrentInputMethod(previousIm);
-            }
-            manager.updateAvailability();
-            logEvent("reclaim ui, now=" + manager.currentUI());
+            // 插件发现 UI 被顶掉了，要求重新申领。走和心跳同一条路径
+            logEvent("reclaim requested");
+            claimUi();
             return;
         }
         if (line.rfind("mode:", 0) == 0) {
@@ -1012,6 +1083,10 @@ private:
     // 已排队关闭：这段窗口里 fd 还在，但不能再往里写
     bool clientClosing_ = false;
     std::unique_ptr<fcitx::EventSource> deferClose_;
+    std::unique_ptr<fcitx::EventSourceTime> heartbeatTimer_;
+    inline_keyboard::HeartbeatState heartbeat_;
+    // 当前 UI 归属是不是 addon（键盘内 UI），只在变化时动 fcitx5
+    bool uiOwned_ = false;
 
     // 文件兜底（probe.sh 用）
     std::string statusPath_;

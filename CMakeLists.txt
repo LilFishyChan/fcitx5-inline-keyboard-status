@@ -9,6 +9,7 @@ find_package(Fcitx5Core REQUIRED)
 add_library(inline-keyboard-status MODULE src/inline-keyboard-status.cpp
     src/addon-support.cpp
     src/client-channel.cpp
+    src/heartbeat.cpp
     src/candidate-payload.cpp)
 target_link_libraries(inline-keyboard-status PRIVATE Fcitx5::Core)
 
@@ -58,3 +59,12 @@ add_executable(test-client-channel
 )
 target_include_directories(test-client-channel PRIVATE src)
 add_test(NAME client-channel COMMAND test-client-channel)
+
+# 心跳调度：只响一次、第二个连接没心跳 —— 两个真实回归都在这里
+add_executable(test-heartbeat
+    tests/test_heartbeat.cpp
+    src/heartbeat.cpp
+    src/client-channel.cpp
+)
+target_include_directories(test-heartbeat PRIVATE src)
+add_test(NAME heartbeat COMMAND test-heartbeat)

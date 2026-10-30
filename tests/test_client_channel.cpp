@@ -149,6 +149,47 @@ void testRepeatedSessions() {
     }
 }
 
+// ---------------- 连接活性（UI 归属的唯一判据） ----------------
+
+void testClientAlive() {
+    constexpr int64_t kTimeout = 5000000; // 5s
+    constexpr int64_t kNow = 100000000;
+
+    // fd 不在 / 已排队关闭：无论时间都算死
+    CHECK(!inline_keyboard::clientIsAlive(false, false, kNow, kNow, kTimeout));
+    CHECK(!inline_keyboard::clientIsAlive(true, true, kNow, kNow, kTimeout));
+
+    // 刚收敛、还没收到任何消息：给一个完整窗口，不算超时
+    CHECK(inline_keyboard::clientIsAlive(true, false, kNow, 0, kTimeout));
+
+    // 刚收到消息
+    CHECK(inline_keyboard::clientIsAlive(true, false, kNow, kNow, kTimeout));
+
+    // 4.9s 前收到：还活着
+    CHECK(inline_keyboard::clientIsAlive(true, false, kNow, kNow - 4900000, kTimeout));
+
+    // 整 5s 前收到：已超时（边界取「小于」）
+    CHECK(!inline_keyboard::clientIsAlive(true, false, kNow, kNow - 5000000, kTimeout));
+
+    // 30s 没消息：早就死了
+    CHECK(!inline_keyboard::clientIsAlive(true, false, kNow, kNow - 30000000, kTimeout));
+}
+
+// 心跳周期 2s、超时 5s 的组合：连续两次心跳没回应才判死，
+// 单次抖动（丢一个 ping）不该让键盘的 UI 归属翻转。
+void testHeartbeatTolerance() {
+    constexpr int64_t kHb = 2000000;
+    constexpr int64_t kTimeout = 5000000;
+    constexpr int64_t t0 = 50000000;
+
+    // 最后一次收到消息在 t0，检查 t0 + 1 个心跳：活着
+    CHECK(inline_keyboard::clientIsAlive(true, false, t0 + kHb, t0, kTimeout));
+    // t0 + 2 个心跳：活着（= 4s < 5s）
+    CHECK(inline_keyboard::clientIsAlive(true, false, t0 + 2 * kHb, t0, kTimeout));
+    // t0 + 3 个心跳：判死（= 6s > 5s）
+    CHECK(!inline_keyboard::clientIsAlive(true, false, t0 + 3 * kHb, t0, kTimeout));
+}
+
 } // namespace
 
 int main() {
@@ -160,6 +201,8 @@ int main() {
     testClosedLocalFd();
     testPeerClosed();
     testRepeatedSessions();
+    testClientAlive();
+    testHeartbeatTolerance();
 
     if (failures == 0) {
         std::printf("all client-channel tests passed\n");
