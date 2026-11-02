@@ -25,7 +25,9 @@ std::string escapeJsonString(const std::string &input);
 // i 是这一项在**原始候选表**里的下标（candidateFromAll 的参数），
 // 必须和传入顺序严格对应：显示层会做去重和过滤，
 // 只有这个下标才能选回真正想要的那一项。
-std::string buildCandidatePayload(const std::vector<std::string> &words);
+// comments 和 words 同下标；空串就是没有小字
+std::string buildCandidatePayload(const std::vector<std::string> &words,
+                                  const std::vector<std::string> &comments);
 
 } // namespace inline_keyboard
 

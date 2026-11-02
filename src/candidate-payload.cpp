@@ -58,7 +58,8 @@ std::string escapeJsonString(const std::string &input) {
     return out;
 }
 
-std::string buildCandidatePayload(const std::vector<std::string> &words) {
+std::string buildCandidatePayload(const std::vector<std::string> &words,
+                                  const std::vector<std::string> &comments) {
     std::string json = "[";
     json.reserve(words.size() * 16 + 2);
     for (std::size_t index = 0; index < words.size(); index++) {
@@ -66,7 +67,12 @@ std::string buildCandidatePayload(const std::vector<std::string> &words) {
             json += ",";
         }
         json += "{\"i\":" + std::to_string(index) + ",\"t\":\"" +
-                escapeJsonString(words[index]) + "\"}";
+                escapeJsonString(words[index]) + "\"";
+        // 有注释才带这个字段，没注释的候选和以前一样
+        if (index < comments.size() && !comments[index].empty()) {
+            json += ",\"c\":\"" + escapeJsonString(comments[index]) + "\"";
+        }
+        json += "}";
     }
     json += "]";
     return json;

@@ -39,27 +39,36 @@ int countOccurrences(const std::string &haystack, const std::string &needle) {
 }
 
 void testEmptyList() {
-    expectEq(inline_keyboard::buildCandidatePayload({}), "[]", "空列表");
+    expectEq(inline_keyboard::buildCandidatePayload({}, {}), "[]", "空列表");
 }
 
 void testSingleWord() {
-    expectEq(inline_keyboard::buildCandidatePayload({"你"}),
+    expectEq(inline_keyboard::buildCandidatePayload({"你"}, {}),
              "[{\"i\":0,\"t\":\"你\"}]", "单个中文词");
 }
 
 void testIndexesAreSequential() {
     const std::vector<std::string> words = {"你", "泥", "尼"};
-    expectEq(inline_keyboard::buildCandidatePayload(words),
+    expectEq(inline_keyboard::buildCandidatePayload(words, {}),
              "[{\"i\":0,\"t\":\"你\"},{\"i\":1,\"t\":\"泥\"},"
              "{\"i\":2,\"t\":\"尼\"}]",
              "下标必须从 0 起严格连续");
+}
+
+void testCommentsRideAlong() {
+    const std::vector<std::string> words = {"测试", "侧视"};
+    const std::vector<std::string> comments = {"cè shì", ""};
+    expectEq(inline_keyboard::buildCandidatePayload(words, comments),
+             "[{\"i\":0,\"t\":\"测试\",\"c\":\"cè shì\"},"
+             "{\"i\":1,\"t\":\"侧视\"}]",
+             "有注释才带 c 字段，空的省掉");
 }
 
 void testDuplicateWordsKeepTheirOwnIndex() {
     // addon 不去重：同一个词出现两次就推两条，各自带自己的下标。
     // 去重是显示层的事，这里去掉会让下标的含义和 candidateFromAll 脱节。
     const std::vector<std::string> words = {"速", "素", "速"};
-    expectEq(inline_keyboard::buildCandidatePayload(words),
+    expectEq(inline_keyboard::buildCandidatePayload(words, {}),
              "[{\"i\":0,\"t\":\"速\"},{\"i\":1,\"t\":\"素\"},"
              "{\"i\":2,\"t\":\"速\"}]",
              "重复词保留各自下标");
@@ -97,7 +106,7 @@ void testUtf8PassesThrough() {
 
 void testLongWordNotTruncated() {
     const std::string longWord(300, 'x');
-    const std::string payload = inline_keyboard::buildCandidatePayload({longWord});
+    const std::string payload = inline_keyboard::buildCandidatePayload({longWord}, {});
     expectEq(std::to_string(countOccurrences(payload, "x")), "300",
              "长词不截断");
 }
@@ -107,7 +116,7 @@ void testManyWordsAllPresent() {
     for (int index = 0; index < 1000; index++) {
         words.push_back("w" + std::to_string(index));
     }
-    const std::string payload = inline_keyboard::buildCandidatePayload(words);
+    const std::string payload = inline_keyboard::buildCandidatePayload(words, {});
     expectEq(std::to_string(countOccurrences(payload, "\"i\":")), "1000",
              "1000 项全部序列化");
     // 最后一项的下标必须是 999
@@ -117,7 +126,7 @@ void testManyWordsAllPresent() {
 
 void testQuotesInWordDoNotBreakJson() {
     const std::string payload =
-        inline_keyboard::buildCandidatePayload({"he said \"hi\"", "a\\b"});
+        inline_keyboard::buildCandidatePayload({"he said \"hi\"", "a\\b"}, {});
     expectEq(payload,
              "[{\"i\":0,\"t\":\"he said \\\"hi\\\"\"},"
              "{\"i\":1,\"t\":\"a\\\\b\"}]",
@@ -130,6 +139,7 @@ int main() {
     testEmptyList();
     testSingleWord();
     testIndexesAreSequential();
+    testCommentsRideAlong();
     testDuplicateWordsKeepTheirOwnIndex();
     testEscapeDoubleQuote();
     testEscapeBackslash();

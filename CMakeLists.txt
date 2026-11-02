@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(inline-keyboard-status VERSION 0.1.0 LANGUAGES CXX)
+project(inline-keyboard-status VERSION 0.1.1 LANGUAGES CXX)
 
 # 版本号编进二进制：插件连上来时会推一行 version:<x.y.z>，键盘那边拿它和自己期望的
 # 版本比对，不一致就提示用户更新 addon
@@ -14,7 +14,8 @@ add_library(inline-keyboard-status MODULE src/inline-keyboard-status.cpp
     src/addon-support.cpp
     src/client-channel.cpp
     src/heartbeat.cpp
-    src/candidate-payload.cpp)
+    src/candidate-payload.cpp
+    src/status-payload.cpp)
 target_link_libraries(inline-keyboard-status PRIVATE Fcitx5::Core)
 
 # 去掉 lib 前缀：conf 里写 Library=inline-keyboard-status 时 fcitx5 直接找
@@ -54,6 +55,15 @@ add_executable(test-candidate-payload
 )
 target_include_directories(test-candidate-payload PRIVATE src)
 add_test(NAME candidate-payload COMMAND test-candidate-payload)
+
+# 状态区开关的序列化：决定键盘里那排输入法开关的顺序、勾选态和文本
+add_executable(test-status-payload
+    tests/test_status_payload.cpp
+    src/status-payload.cpp
+    src/candidate-payload.cpp
+)
+target_include_directories(test-status-payload PRIVATE src)
+add_test(NAME status-payload COMMAND test-status-payload)
 
 # 客户端 socket 的写入 / 失败判定：fcitx5 崩在这里过（EBADF 被当致命异常），
 # 每个分支都钉住。

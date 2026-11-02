@@ -35,6 +35,7 @@
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/keysym.h>
 
+#include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
@@ -43,6 +44,8 @@
 #include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputmethodentry.h>
 #include <fcitx/inputmethodmanager.h>
+#include <fcitx/menu.h>
+#include <fcitx/statusarea.h>
 #include <fcitx/instance.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
@@ -68,6 +71,7 @@
 
 #include "addon-support.h"
 #include "candidate-payload.h"
+#include "status-payload.h"
 #include "keysym-map.h"
 
 namespace {
@@ -380,6 +384,8 @@ private:
         std::string imIcon;
         bool isKeyboard = false;
         std::vector<std::string> items;
+        // 每项的注释（rime 的拼音之类），和 items 一一对应
+        std::vector<std::string> comments;
         bool hasMore = false;
         bool hasPrev = false;
         bool hasNext = false;
@@ -401,6 +407,7 @@ private:
 
         if (auto list = panel.candidateList()) {
             collectTopCandidates(preedit, list.get(), snapshot.items,
+                                 snapshot.comments,
                                  snapshot.hasMore);
             if (auto *pageable = list->toPageable()) {
                 snapshot.hasPrev = pageable->hasPrev();
@@ -485,8 +492,88 @@ private:
             }
             json += "\"" + inline_keyboard::escapeJsonString(snapshot.items[i]) + "\"";
         }
-        json += "]}";
+        json += "]";
+        // 注释和 items 一一对应；一条都没有就省掉，别为了空数组白占带宽
+        bool anyComment = false;
+        for (const auto &comment : snapshot.comments) {
+            if (!comment.empty()) {
+                anyComment = true;
+                break;
+            }
+        }
+        if (anyComment) {
+            json += ",\"comments\":[";
+            for (size_t i = 0; i < snapshot.comments.size(); i++) {
+                if (i) {
+                    json += ",";
+                }
+                json += "\"" +
+                        inline_keyboard::escapeJsonString(snapshot.comments[i]) +
+                        "\"";
+            }
+            json += "]";
+        }
+        json += "}";
         return json;
+    }
+
+    // ---------------- 状态区开关（StatusGroup::InputMethod） ----------------
+
+    // 递归展开一个 action 列表：子菜单走 Menu::actions()
+    void collectStatusActions(const std::vector<fcitx::Action *> &actions,
+                              fcitx::InputContext *ic,
+                              std::vector<inline_keyboard::StatusItem> &out) {
+        for (auto *action : actions) {
+            if (action == nullptr) {
+                continue;
+            }
+            inline_keyboard::StatusItem item;
+            item.name = action->name();
+            item.separator = action->isSeparator();
+            if (!item.separator) {
+                // shortText 里 rime 自己带了状态，比如「半角→全角」，所以每次都要重取
+                item.text = action->shortText(ic);
+                item.icon = action->icon(ic);
+                item.checked = action->isChecked(ic);
+                if (auto *sub = action->menu()) {
+                    collectStatusActions(sub->actions(), ic, item.children);
+                }
+                // 没有文字又没有子菜单，画到键盘上就是一行空白
+                if (item.text.empty() && item.children.empty()) {
+                    continue;
+                }
+            }
+            out.push_back(std::move(item));
+        }
+    }
+
+    // 只取 InputMethod 分组：输入法列表键盘自己已经有了，重启/退出那些暂时不需要
+    std::vector<inline_keyboard::StatusItem>
+    collectStatusItems(fcitx::InputContext *ic) {
+        std::vector<inline_keyboard::StatusItem> items;
+        if (ic == nullptr) {
+            return items;
+        }
+        collectStatusActions(
+            ic->statusArea().actions(fcitx::StatusGroup::InputMethod), ic, items);
+        return items;
+    }
+
+    void pushStatus(fcitx::InputContext *ic) {
+        const auto items = collectStatusItems(ic);
+        // 只在数量变化时打一行：排查「键盘里那排开关为什么空着」时的第一手材料
+        const std::string count = std::to_string(items.size()) + "/" +
+                                  (ic ? instance_->currentInputMethod() : "");
+        if (count != lastStatusCount_) {
+            lastStatusCount_ = count;
+            logEvent("status items=" + count);
+        }
+        const std::string json = inline_keyboard::buildStatusPayload(items);
+        if (json == lastStatusJson_) {
+            return;
+        }
+        lastStatusJson_ = json;
+        pushLine("status:" + json);
     }
 
     void pushState(fcitx::InputContext *ic) {
@@ -508,6 +595,8 @@ private:
                      " fe=" + std::string(ic->frontendName()));
         }
         pushDeduped(json);
+        // 开关状态跟着一起推：rime 切方案后 shortText 会变（简体 / 繁体）
+        pushStatus(ic);
     }
 
     // 顶部候选：取前 kTopCandidateSlots 个，并判断还有没有更多。
@@ -516,24 +605,31 @@ private:
     // 只比 size 的话翻页检测不到（页大小不变、内容变了）。
     void collectTopCandidates(const fcitx::Text &preedit,
                               fcitx::CandidateList *list,
-                              std::vector<std::string> &items, bool &hasMore) {
+                              std::vector<std::string> &items,
+                              std::vector<std::string> &comments,
+                              bool &hasMore) {
         const std::string key = preedit.toString() + "\x1f" +
                                 firstCandidateText(list) + "\x1f" +
                                 std::to_string(list->size());
         if (key == topCacheKey_) {
             items = topCacheItems_;
+            comments = topCacheComments_;
             hasMore = topCacheHasMore_;
             return;
         }
 
         std::vector<std::string> collected;
+        std::vector<std::string> collectedComments;
         bool more = false;
-        readCandidates(list, kTopCandidateSlots, collected, more);
+        readCandidates(list, kTopCandidateSlots, collected, collectedComments,
+                       more);
 
         topCacheKey_ = key;
         topCacheItems_ = collected;
+        topCacheComments_ = collectedComments;
         topCacheHasMore_ = more;
         items = collected;
+        comments = collectedComments;
         hasMore = more;
     }
 
@@ -557,14 +653,15 @@ private:
     //     官方建议 catch 它当遍历结束信号。
     //   所以先用 totalSize()，拿不到再靠异常兜底。
     void readCandidates(fcitx::CandidateList *list, int limit,
-                        std::vector<std::string> &out, bool &hasMore) {
+                        std::vector<std::string> &out,
+                        std::vector<std::string> &comments, bool &hasMore) {
         hasMore = false;
         if (!list) {
             return;
         }
 
         if (auto *bulk = list->toBulk()) {
-            readBulkCandidates(bulk, limit, out, hasMore);
+            readBulkCandidates(bulk, limit, out, comments, hasMore);
             if (!out.empty() || hasMore) {
                 return;
             }
@@ -577,6 +674,7 @@ private:
             const auto &candidate = list->candidate(i);
             if (!candidate.isPlaceHolder()) {
                 out.push_back(candidate.text().toString());
+                comments.push_back(candidate.comment().toString());
             }
         }
         if (auto *pageable = list->toPageable()) {
@@ -585,7 +683,8 @@ private:
     }
 
     void readBulkCandidates(fcitx::BulkCandidateList *bulk, int limit,
-                            std::vector<std::string> &out, bool &hasMore) {
+                            std::vector<std::string> &out,
+                            std::vector<std::string> &comments, bool &hasMore) {
         const int total = bulk->totalSize();
         logEvent("bulk totalSize=" + std::to_string(total) +
                  " limit=" + std::to_string(limit));
@@ -597,6 +696,7 @@ private:
                 const auto &candidate = bulk->candidateFromAll(i);
                 if (!candidate.isPlaceHolder()) {
                     out.push_back(candidate.text().toString());
+                    comments.push_back(candidate.comment().toString());
                 }
             }
             hasMore = total > limit;
@@ -616,6 +716,7 @@ private:
                     break;
                 }
                 out.push_back(candidate.text().toString());
+                comments.push_back(candidate.comment().toString());
             } catch (const std::exception &error) {
                 logEvent("bulk end idx=" + std::to_string(i) +
                          " why=" + std::string(error.what()));
@@ -637,12 +738,15 @@ private:
         }
 
         std::vector<std::string> words;
+        std::vector<std::string> comments;
         bool hasMore = false;
         if (auto list = ic->inputPanel().candidateList()) {
-            readCandidates(list.get(), kMaxCandidateScan, words, hasMore);
+            readCandidates(list.get(), kMaxCandidateScan, words, comments,
+                           hasMore);
         }
 
-        const std::string json = inline_keyboard::buildCandidatePayload(words);
+        const std::string json =
+            inline_keyboard::buildCandidatePayload(words, comments);
         inline_keyboard::atomicWrite(allCandPath_, json + "\n");
         pushLine("allcand:" + json);
         logEvent("allcand count=" + std::to_string(words.size()) +
@@ -686,6 +790,36 @@ private:
     // 插件给的 index 是**原始全局下标**（candidateFromAll 的参数）。
     // 之前这里用 list->size() 当上界，导致第 7 个之后永远选不中 ——
     // size() 只是当前页的条数。
+    // 键盘上点了状态区的某一项：按 name 找到对应的 action 调 activate。
+    // 子菜单里的项也在同一棵树里，一起找
+    bool activateStatusAction(const std::string &name) {
+        auto *ic = activeContext();
+        if (ic == nullptr) {
+            return false;
+        }
+        std::vector<fcitx::Action *> stack(
+            ic->statusArea().actions(fcitx::StatusGroup::InputMethod));
+        while (!stack.empty()) {
+            auto *action = stack.back();
+            stack.pop_back();
+            if (action == nullptr) {
+                continue;
+            }
+            if (name == action->name()) {
+                action->activate(ic);
+                logEvent("activate name=" + name);
+                return true;
+            }
+            if (auto *sub = action->menu()) {
+                for (auto *child : sub->actions()) {
+                    stack.push_back(child);
+                }
+            }
+        }
+        logEvent("activate missed name=" + name);
+        return false;
+    }
+
     void selectCandidate(int index) {
         fcitx::InputContext *ic = activeContext();
         if (!ic) {
@@ -838,6 +972,7 @@ private:
         clientFd_ = fd;
         clientBuffer_.clear();
         lastStateJson_.clear();
+        lastStatusJson_.clear();
 
         // 立刻给一份完整快照。不能等下一次 update()：
         // 键盘没输入时 update() 不会触发，新客户端会一直空等。
@@ -848,6 +983,7 @@ private:
         pushLine("version:" INLINE_KEYBOARD_VERSION);
         if (auto *ic = activeContext()) {
             pushState(ic);
+            // pushState 里已经带了 pushStatus，这里不用重复
         }
 
         clientWatcher_ = instance_->eventLoop().addIOEvent(
@@ -953,6 +1089,10 @@ private:
         }
         if (line.rfind("select:", 0) == 0) {
             selectCandidate(std::atoi(line.c_str() + 7));
+            return;
+        }
+        if (line.rfind("activate:", 0) == 0) {
+            activateStatusAction(line.substr(9));
             return;
         }
         if (line == "pong") {
@@ -1102,6 +1242,8 @@ private:
     std::string logPath_;
 
     std::string lastStateJson_;
+    std::string lastStatusJson_;
+    std::string lastStatusCount_;
     uint64_t lastModeAttempt_ = 0;
     std::string selfUiName_;
 
@@ -1121,6 +1263,7 @@ private:
     // 顶部候选缓存
     std::string topCacheKey_;
     std::vector<std::string> topCacheItems_;
+    std::vector<std::string> topCacheComments_;
     bool topCacheHasMore_ = false;
 };
 
