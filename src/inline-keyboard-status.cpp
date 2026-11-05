@@ -952,6 +952,16 @@ private:
             return;
         }
         logEvent("listen path=" + sockPath_);
+        // 版本文件：设置页读它做版本检查。设置页不能自己连 socket
+        // （单客户端设计，新连接会顶掉键盘），所以用文件传版本。
+        {
+            const std::string vpath =
+                inline_keyboard::runtimeDir() + "/inline-keyboard.version";
+            if (FILE *vf = std::fopen(vpath.c_str(), "w")) {
+                std::fprintf(vf, "%s\n", INLINE_KEYBOARD_VERSION);
+                std::fclose(vf);
+            }
+        }
         acceptWatcher_ = instance_->eventLoop().addIOEvent(
             listenFd_, fcitx::IOEventFlags{fcitx::IOEventFlag::In},
             [this](fcitx::EventSourceIO *, int, fcitx::IOEventFlags) {
