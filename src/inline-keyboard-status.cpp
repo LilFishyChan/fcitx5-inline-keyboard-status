@@ -398,12 +398,30 @@ private:
 
         // wayland 下拼音串在 clientPreedit 里，panel.preedit() 常常是空的
         const fcitx::Text &clientPreedit = panel.clientPreedit();
+        const bool embeddedPreedit = !clientPreedit.empty();
         const fcitx::Text &preedit =
-            clientPreedit.empty() ? panel.preedit() : clientPreedit;
+            embeddedPreedit ? clientPreedit : panel.preedit();
         snapshot.preedit = preedit.toString();
-        snapshot.cursor = preedit.cursor();
+
+        // cursor 按可信度依次取（rime 实测：panel 恒 -1，client 才带真值 8 / 6）：
+        //   1) panel.preedit()  —— 输入法引擎自己的，>= 0 时最可信
+        //   2) clientPreedit    —— wayland 回读的，实测带真实位置
+        //   3) 都没有 → 末尾
+        // 两个 Text 的文字不一定一样长，越界一律夹到串长。
+        int cursor = -1;
+        if (!panel.preedit().empty() && panel.preedit().cursor() >= 0)
+            cursor = panel.preedit().cursor();
+        else if (clientPreedit.cursor() >= 0)
+            cursor = clientPreedit.cursor();
+        else if (!embeddedPreedit)
+            cursor = preedit.cursor();
+
+        if (cursor < 0 || cursor > static_cast<int>(snapshot.preedit.size()))
+            cursor = static_cast<int>(snapshot.preedit.size());
+
+        snapshot.cursor = cursor;
         // 应用自己把预编辑渲染进输入框时，键盘不用再画一遍
-        snapshot.embedded = !clientPreedit.empty();
+        snapshot.embedded = embeddedPreedit;
 
         if (auto list = panel.candidateList()) {
             collectTopCandidates(preedit, list.get(), snapshot.items,
