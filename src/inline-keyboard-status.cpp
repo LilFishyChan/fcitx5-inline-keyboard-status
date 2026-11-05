@@ -403,21 +403,28 @@ private:
             embeddedPreedit ? clientPreedit : panel.preedit();
         snapshot.preedit = preedit.toString();
 
-        // cursor 按可信度依次取（rime 实测：panel 恒 -1，client 才带真值 8 / 6）：
-        //   1) panel.preedit()  —— 输入法引擎自己的，>= 0 时最可信
-        //   2) clientPreedit    —— wayland 回读的，实测带真实位置
-        //   3) 都没有 → 末尾
-        // 两个 Text 的文字不一定一样长，越界一律夹到串长。
-        int cursor = -1;
-        if (!panel.preedit().empty() && panel.preedit().cursor() >= 0)
-            cursor = panel.preedit().cursor();
-        else if (clientPreedit.cursor() >= 0)
-            cursor = clientPreedit.cursor();
-        else if (!embeddedPreedit)
-            cursor = preedit.cursor();
+        // cursor 必须和 snapshot.preedit 同源：按来源挑 cursor 会和实际输出的文字错位。
+        // fcitx5 在 clientPreedit 为空时会 reset 成 cursor=0（不是 -1），
+        // 而 panel 与 client 的文字又不保证是同一串（CommitPreview 下 panel 是拼音、
+        // client 是整句），跨源取会得到一个「在范围内但位置错」的光标。
+        const fcitx::Text &panelPreedit = panel.preedit();
+        int cursor = preedit.cursor();
 
-        if (cursor < 0 || cursor > static_cast<int>(snapshot.preedit.size()))
-            cursor = static_cast<int>(snapshot.preedit.size());
+        // 另一来源只有在文字逐字节相同时才允许借用它的 cursor
+        if (cursor < 0) {
+            const fcitx::Text &other = embeddedPreedit ? panelPreedit : clientPreedit;
+            if (other.cursor() >= 0 && other.toString() == snapshot.preedit)
+                cursor = other.cursor();
+        }
+
+        const int textBytes = static_cast<int>(snapshot.preedit.size());
+        if (cursor < 0 || cursor > textBytes)
+            cursor = textBytes;
+
+        // 落在 UTF-8 续字节上就退到该字符起点，别把光标劈进字符中间
+        while (cursor > 0 && cursor < textBytes
+               && (static_cast<unsigned char>(snapshot.preedit[static_cast<size_t>(cursor)]) & 0xC0) == 0x80)
+            --cursor;
 
         snapshot.cursor = cursor;
         // 应用自己把预编辑渲染进输入框时，键盘不用再画一遍
